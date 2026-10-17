@@ -6,7 +6,9 @@
 }
 
 @theme inline {
-  --color-background: var(--background);
+  /* Legacy landing-page tokens. The landing page renders on the light palette via the
+     :root vars below and never consumes the utility names being re-mapped here, so it
+     is unaffected by the Veltra app tokens that follow. */
   --color-foreground: var(--foreground);
   --color-paper: #f5f2e9;
   --color-ink: #1a1e1c;
@@ -15,6 +17,24 @@
   --font-display: var(--font-inter-tight), var(--font-geist-sans), ui-sans-serif,
     system-ui, sans-serif;
   --font-mono: var(--font-geist-mono);
+
+  /* Veltra app palette (locked, M0) — consumed by member/admin pages from M1 on.
+     Note: bg-background becomes the Veltra navy at the utility level; the landing page
+     only paints backgrounds through the :root var, never through the utility. */
+  --color-background: #0f172a;
+  /* surface: cards, panels, forms. */
+  --color-surface: #1e293b;
+  /* accent: buttons and links. */
+  --color-accent: #00e6c3;
+  /* IMPORTANT — emerald rule: --color-success is reserved for money-positive signals
+     only (earnings, approved, credited, refunded). Never use it for favours, warnings, or
+     generic "good" states; those use muted/accent. Money-negative and neutral feedback
+     must not borrow it. */
+  --color-success: #33c98e;
+  /* text primary: white. */
+  --color-content: #ffffff;
+  /* text secondary: slate-400. */
+  --color-muted: #94a3b8;
 }
 
 html {
