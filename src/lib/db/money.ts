@@ -42,8 +42,8 @@ export function formatPaisa(paisa: bigint): string {
 /** Parses a user-entered rupee amount into integer paisa.
  *
  *  Accepts: "1200", "1,200", "Rs. 1,200.50", "1200.5". Returns paisa: 120000n, 120000n,
- *  120050n, 120050n. A comma-masked input must be properly grouped in threes starting
- *  from the left ("1,200.50" ok, "1,20" rejected). At most 2 decimal places.
+ *  120050n, 120050n. A comma-masked input must be grouped in threes after a one- to
+ *  three-digit leading group ("1,200.50" ok, "1,20" rejected). At most 2 decimal places.
  *  Throws on anything else: empty strings, letters, negatives, >2 decimals.
  */
 export function parsePaisa(input: string): bigint {

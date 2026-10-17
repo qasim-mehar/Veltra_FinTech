@@ -137,6 +137,20 @@ async function checkPartialIndex() {
   });
 }
 
+type CleanTask = () => Promise<unknown>;
+
+/** Best-effort cleanup: delete throwaway rows even if a check fails mid-flight. */
+async function cleanupTasks(tasks: CleanTask[]) {
+  for (const task of tasks) {
+    try {
+      await task();
+    } catch {
+      // A counter that already got cleaned, or a parent row still referenced —
+      // report nothing; checks after this one do not depend on throwaway rows.
+    }
+  }
+}
+
 async function checkDuplicateTidRejected(plans: { id: string; price: bigint }[]) {
   const plan = plans[0];
   const tid = `VERIFY-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -150,32 +164,42 @@ async function checkDuplicateTidRejected(plans: { id: string; price: bigint }[])
     amount: plan.price,
   };
 
-  const first = await prisma.deposit.create({
-    data: { ...base, userId: userA.id, tid, status: "PENDING" },
-  });
-
-  let secondError: unknown = null;
+  // Cleanup runs even if an insert/query throws an unexpected error type mid-check.
+  const cleanup: CleanTask[] = [];
   try {
-    await prisma.deposit.create({
-      data: { ...base, userId: userB.id, tid, status: "PENDING" },
+    const first = await prisma.deposit.create({
+      data: { ...base, userId: userA.id, tid, status: "PENDING" },
     });
-  } catch (error) {
-    secondError = error;
+    cleanup.push(() => prisma.deposit.delete({ where: { id: first.id } }));
+
+    let secondError: unknown = null;
+    try {
+      await prisma.deposit.create({
+        data: { ...base, userId: userB.id, tid, status: "PENDING" },
+      });
+    } catch (error) {
+      secondError = error;
+    }
+
+    const code =
+      secondError instanceof Prisma.PrismaClientKnownRequestError ? secondError.code : "";
+    report("same TID cannot be PENDING twice (second insert throws)", {
+      ok:
+        secondError !== null &&
+        secondError instanceof Prisma.PrismaClientKnownRequestError &&
+        secondError.code === "P2002",
+      detail:
+        secondError === null
+          ? "Second insert UNEXPECTEDLY succeeded."
+          : `Second insert rejected with ${
+              secondError instanceof Prisma.PrismaClientKnownRequestError
+                ? `Prisma ${code}`
+                : "unknown error type"
+            }.`,
+    });
+  } finally {
+    await cleanupTasks([...cleanup, () => prisma.user.delete({ where: { id: userA.id } }), () => prisma.user.delete({ where: { id: userB.id } })]);
   }
-
-  const res = secondError instanceof Prisma.PrismaClientKnownRequestError;
-  const code = secondError instanceof Prisma.PrismaClientKnownRequestError ? secondError.code : "";
-  report("same TID cannot be PENDING twice (second insert throws)", {
-    ok: secondError !== null && res && code === "P2002",
-    detail:
-      secondError === null
-        ? "Second insert UNEXPECTEDLY succeeded."
-        : `Second insert rejected with ${res ? `Prisma ${code}` : "unknown error type"}.`,
-  });
-
-  await prisma.deposit.delete({ where: { id: first.id } });
-  await prisma.user.delete({ where: { id: userA.id } });
-  await prisma.user.delete({ where: { id: userB.id } });
   return tid;
 }
 
@@ -190,35 +214,38 @@ async function checkRejectedTidReusable(plans: { id: string; price: bigint }[], 
     amount: plans[0].price,
   };
 
-  const first = await prisma.deposit.create({
-    data: { ...base, userId: userA.id, tid, status: "PENDING" },
-  });
-  // Move the first one to REJECTED: the TID leaves the "live" set.
-  await prisma.deposit.update({
-    where: { id: first.id },
-    data: { status: "REJECTED", rejectionReason: "verify-foundation" },
-  });
-
-  let createdSecond: string | null = null;
-  let failure: Error | null = null;
+  const cleanup: CleanTask[] = [];
   try {
-    const second = await prisma.deposit.create({
-      data: { ...base, userId: userB.id, tid, status: "PENDING" },
+    const first = await prisma.deposit.create({
+      data: { ...base, userId: userA.id, tid, status: "PENDING" },
     });
-    createdSecond = second.id;
-  } catch (error) {
-    failure = error instanceof Error ? error : new Error(String(error));
+    cleanup.push(() => prisma.deposit.delete({ where: { id: first.id } }));
+
+    // Move the first one to REJECTED: the TID leaves the "live" set.
+    await prisma.deposit.update({
+      where: { id: first.id },
+      data: { status: "REJECTED", rejectionReason: "verify-foundation" },
+    });
+
+    let createdSecond: string | null = null;
+    let failure: Error | null = null;
+    try {
+      const second = await prisma.deposit.create({
+        data: { ...base, userId: userB.id, tid, status: "PENDING" },
+      });
+      createdSecond = second.id;
+      cleanup.push(() => prisma.deposit.delete({ where: { id: second.id } }));
+    } catch (error) {
+      failure = error instanceof Error ? error : new Error(String(error));
+    }
+
+    report("rejected TID may be re-submitted (same TID PENDING again succeeds)", {
+      ok: createdSecond !== null,
+      detail: createdSecond !== null ? "Re-submitted PENDING deposit accepted after REJECT." : `Unexpectedly rejected: ${failure?.message ?? "unknown error"}`,
+    });
+  } finally {
+    await cleanupTasks([...cleanup, () => prisma.user.delete({ where: { id: userA.id } }), () => prisma.user.delete({ where: { id: userB.id } })]);
   }
-
-  report("rejected TID may be re-submitted (same TID PENDING again succeeds)", {
-    ok: createdSecond !== null,
-    detail: createdSecond !== null ? "Re-submitted PENDING deposit accepted after REJECT." : `Unexpectedly rejected: ${failure?.message ?? "unknown error"}`,
-  });
-
-  if (createdSecond) await prisma.deposit.delete({ where: { id: createdSecond } });
-  await prisma.deposit.delete({ where: { id: first.id } });
-  await prisma.user.delete({ where: { id: userA.id } });
-  await prisma.user.delete({ where: { id: userB.id } });
 }
 
 async function main() {
