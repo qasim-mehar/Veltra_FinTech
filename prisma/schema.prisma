@@ -1,0 +1,358 @@
+// Veltra — Milestone 0 foundation schema.
+//
+// Contract rules baked into this schema:
+// - Money is integer paisa stored as BigInt everywhere. Rs. 1,200 = 120000. No floats.
+// - Rates are integer basis points. 1% = 100 bps, 1.5% = 150 bps, 10% = 1000 bps.
+// - `transactions` is the append-only ledger: application code never updates or deletes rows.
+// - All models/columns are mapped to snake_case so raw SQL (indexes, migrations, the
+//   cron job) talks to predictable lowercase table and column names.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum UserStatus {
+  ACTIVE
+  BLOCKED
+
+  @@map("user_status")
+}
+
+enum DepositStatus {
+  PENDING
+  APPROVED
+  REJECTED
+
+  @@map("deposit_status")
+}
+
+enum WithdrawalStatus {
+  PENDING
+  DISPATCHED
+  REJECTED
+
+  @@map("withdrawal_status")
+}
+
+enum WithdrawalMethod {
+  SADAPAY
+  EASYPAISA
+  JAZZCASH
+
+  @@map("withdrawal_method")
+}
+
+enum InvestmentStatus {
+  ACTIVE
+  STOPPED
+
+  @@map("investment_status")
+}
+
+enum TransactionType {
+  PROFIT
+  REFERRAL_BONUS
+  REFERRAL_COMMISSION
+  WITHDRAWAL
+  WITHDRAWAL_REFUND
+  MANUAL_ADJUSTMENT
+
+  @@map("transaction_type")
+}
+
+// ─── Identity ────────────────────────────────────────────────────────────────
+
+model User {
+  id           String     @id @default(cuid())
+  firstName    String     @map("first_name")
+  lastName     String     @map("last_name")
+  // Enforced lowercase by application code before persisting; unique at the DB level.
+  username     String     @unique
+  phone        String
+  email        String     @unique
+  passwordHash String     @map("password_hash")
+  referredById String?    @map("referred_by_id")
+  balance      BigInt     @default(0)
+  status       UserStatus @default(ACTIVE)
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+
+  referredBy    User?           @relation("Referrals", fields: [referredById], references: [id])
+  referrals     User[]          @relation("Referrals")
+  sessions      MemberSession[]
+  investments   Investment[]
+  deposits      Deposit[]
+  withdrawals   Withdrawal[]
+  transactions  Transaction[]
+  notifications Notification[]
+  dailyEarnings DailyEarning[]
+  referralsMade Referral[]      @relation("Referrer")
+  refereeRecord Referral?       @relation("Referee")
+
+  @@map("users")
+}
+
+model Admin {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  sessions            AdminSession[]
+  reviewedDeposits    Deposit[]
+  reviewedWithdrawals Withdrawal[]
+  actions             AdminAction[]
+
+  @@map("admins")
+}
+
+model MemberSession {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique @map("token_hash")
+  userId    String   @map("user_id")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("member_sessions")
+}
+
+model AdminSession {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique @map("token_hash")
+  adminId   String   @map("admin_id")
+  admin     Admin    @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("admin_sessions")
+}
+
+// ─── Plans, investments, deposits ────────────────────────────────────────────
+
+model Plan {
+  id                 String   @id @default(cuid())
+  name               String   @unique
+  // Integer paisa. Beginner Rs. 1,200 = 120000, Intermediate Rs. 1,600 = 160000,
+  // Advanced Rs. 2,600 = 260000, VIP Master Rs. 4,000 = 400000.
+  price              BigInt
+  // Integer basis points. 1% = 100 bps, 1.5% = 150 bps, 2% = 200 bps.
+  dailyReturnRateBps Int      @map("daily_return_rate_bps")
+  isActive           Boolean  @default(true) @map("is_active")
+  sortOrder          Int      @map("sort_order")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  investments Investment[]
+  deposits    Deposit[]
+
+  @@map("plans")
+}
+
+model Investment {
+  id                  String           @id @default(cuid())
+  userId              String           @map("user_id")
+  user                User             @relation(fields: [userId], references: [id])
+  planId              String           @map("plan_id")
+  plan                Plan             @relation(fields: [planId], references: [id])
+  depositId           String?          @unique @map("deposit_id")
+  deposit             Deposit?         @relation(fields: [depositId], references: [id])
+  status              InvestmentStatus @default(ACTIVE)
+  activatedAt         DateTime         @default(now()) @map("activated_at")
+  accumulatedEarnings BigInt           @default(0) @map("accumulated_earnings")
+  createdAt           DateTime         @default(now()) @map("created_at")
+
+  dailyEarnings DailyEarning[]
+
+  @@map("investments")
+}
+
+model Deposit {
+  id              String        @id @default(cuid())
+  userId          String        @map("user_id")
+  user            User          @relation(fields: [userId], references: [id])
+  planId          String        @map("plan_id")
+  plan            Plan          @relation(fields: [planId], references: [id])
+  name            String
+  email           String
+  senderNumber    String        @map("sender_number")
+  // SadaPay transaction ID. Partial unique index `deposits_tid_live_unique` in the
+  // foundation migration forbids the same TID twice while PENDING/APPROVED;
+  // rejected TIDs may be re-submitted.
+  tid             String
+  amount          BigInt
+  status          DepositStatus @default(PENDING)
+  rejectionReason String?       @map("rejection_reason")
+  reviewedById    String?       @map("reviewed_by_id")
+  reviewedBy      Admin?        @relation(fields: [reviewedById], references: [id])
+  reviewedAt      DateTime?     @map("reviewed_at")
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  investment Investment?
+
+  @@index([status, createdAt])
+  @@index([tid])
+  @@map("deposits")
+}
+
+// ─── Withdrawals ─────────────────────────────────────────────────────────────
+
+model Withdrawal {
+  id              String           @id @default(cuid())
+  userId          String           @map("user_id")
+  user            User             @relation(fields: [userId], references: [id])
+  amount          BigInt
+  method          WithdrawalMethod
+  accountTitle    String           @map("account_title")
+  accountNumber   String           @map("account_number")
+  status          WithdrawalStatus @default(PENDING)
+  rejectionReason String?          @map("rejection_reason")
+  reviewedById    String?          @map("reviewed_by_id")
+  reviewedBy      Admin?           @relation(fields: [reviewedById], references: [id])
+  reviewedAt      DateTime?        @map("reviewed_at")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+
+  @@index([status, createdAt])
+  @@map("withdrawals")
+}
+
+// ─── Ledger ──────────────────────────────────────────────────────────────────
+
+// Append-only ledger. Credit amounts are positive debits negative. Nothing in the
+// application is allowed to update or delete a row here.
+model Transaction {
+  id            String          @id @default(cuid())
+  userId        String          @map("user_id")
+  user          User            @relation(fields: [userId], references: [id])
+  type          TransactionType
+  // Signed integer paisa: credit positive, debit negative.
+  amount        BigInt
+  balanceAfter  BigInt          @map("balance_after")
+  referenceType String?         @map("reference_type")
+  referenceId   String?         @map("reference_id")
+  description   String
+  createdAt     DateTime        @default(now()) @map("created_at")
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("transactions")
+}
+
+// ─── Referrals ───────────────────────────────────────────────────────────────
+
+model Referral {
+  id                    String   @id @default(cuid())
+  referrerId            String   @map("referrer_id")
+  referrer              User     @relation("Referrer", fields: [referrerId], references: [id])
+  // One Referral row per referee — their referer changes never.
+  refereeId             String   @unique @map("referee_id")
+  referee               User     @relation("Referee", fields: [refereeId], references: [id])
+  firstDepositBonusPaid Boolean  @default(false) @map("first_deposit_bonus_paid")
+  totalCommissionEarned BigInt   @default(0) @map("total_commission_earned")
+  createdAt             DateTime @default(now()) @map("created_at")
+
+  @@map("referrals")
+}
+
+// One row per investment per day. The composite unique makes the daily cron
+// idempotent: re-running a day can never credit the same investment twice.
+model DailyEarning {
+  id                 String     @id @default(cuid())
+  investmentId       String     @map("investment_id")
+  investment         Investment @relation(fields: [investmentId], references: [id])
+  userId             String     @map("user_id")
+  user               User       @relation(fields: [userId], references: [id])
+  // Calendar date of the credited day, timezone-independent.
+  creditDate         DateTime   @map("credit_date") @db.Date
+  amount             BigInt
+  rateUsedBps        Int        @map("rate_used_bps")
+  referralCommission BigInt?    @map("referral_commission")
+  createdAt          DateTime   @default(now()) @map("created_at")
+
+  @@unique([investmentId, creditDate])
+  @@index([userId, creditDate])
+  @@map("daily_earnings")
+}
+
+// ─── Notifications, admin audit, settings, ops ──────────────────────────────
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  user      User     @relation(fields: [userId], references: [id])
+  type      String
+  title     String
+  body      String
+  isRead    Boolean  @default(false) @map("is_read")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId, createdAt])
+  @@map("notifications")
+}
+
+model AdminAction {
+  id         String   @id @default(cuid())
+  adminId    String   @map("admin_id")
+  admin      Admin    @relation(fields: [adminId], references: [id])
+  action     String
+  targetType String   @map("target_type")
+  targetId   String?  @map("target_id")
+  before     Json?
+  after      Json?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@map("admin_actions")
+}
+
+model Setting {
+  key   String @id
+  value String
+
+  @@map("settings")
+}
+
+model LoginAttempt {
+  id          String    @id @default(cuid())
+  key         String    @unique
+  windowStart DateTime  @map("window_start")
+  count       Int       @default(0)
+  lockedUntil DateTime? @map("locked_until")
+
+  @@map("login_attempts")
+}
+
+model CronRun {
+  id         String    @id @default(cuid())
+  // One row per calendar day — unique so the cron job can detect an already-completed run.
+  runDate    DateTime  @unique @map("run_date") @db.Date
+  startedAt  DateTime  @default(now()) @map("started_at")
+  finishedAt DateTime? @map("finished_at")
+  processed  Int
+  credited   Int
+  skipped    Int
+  remaining  Int
+  outcome    String
+
+  @@map("cron_runs")
+}
+
+model SupportMessage {
+  id        String   @id @default(cuid())
+  name      String
+  email     String
+  message   String
+  isHandled Boolean  @default(false) @map("is_handled")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("support_messages")
+}

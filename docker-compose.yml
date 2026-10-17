@@ -1,0 +1,23 @@
+# Single command local database for Veltra: `docker compose up -d`.
+# Credentials match .env.example: user / password / database "veltra" on port 5432.
+services:
+  db:
+    image: postgres:16
+    container_name: veltra-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: veltra
+    ports:
+      - "5432:5432"
+    volumes:
+      - veltra_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d veltra"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  veltra_pgdata:
